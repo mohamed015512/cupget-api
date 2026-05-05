@@ -1,0 +1,23 @@
+# render.yaml — Render.com deployment blueprint
+# Docs: https://render.com/docs/blueprint-spec
+
+services:
+  - type: web
+    name: cupget-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    region: oregon          # change to: frankfurt | singapore | ohio
+    plan: free              # upgrade to: starter | standard | pro
+
+    # ── Environment variables ─────────────────────────────────
+    envVars:
+      - key: PORT
+        value: "8000"
+      - key: PYTHONUNBUFFERED
+        value: "1"
+
+    # ── Health check ──────────────────────────────────────────
+    healthCheckPath: /health
+
+    # ── Auto-deploy on push ───────────────────────────────────
+    autoDeploy: true
