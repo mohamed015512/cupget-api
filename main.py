@@ -262,15 +262,41 @@ async def health_check():
     return {"status": "healthy"}
 
 
-@app.post("/extract", response_model=ExtractResponse, tags=["Extractor"])
-async def extract(payload: ExtractRequest):
+@app.api_route("/extract", methods=["GET", "POST"], tags=["Extractor"])
+async def extract(request: Request, url: str = None):
     """
     Extract video metadata and direct download links from a URL.
+
+    - GET  /extract?url=https://...
+    - POST /extract  {"url": "https://..."}
 
     Supports: YouTube, TikTok, Instagram, Twitter/X, Facebook, Vimeo,
     Dailymotion, Reddit, Twitch, Snapchat, and 1000+ more sites.
     """
-    url = payload.url
+    # ── استخراج الـ URL من GET أو POST ──────────
+    target_url = url  # من query string في حالة GET
+
+    if not target_url and request.method == "POST":
+        try:
+            body = await request.json()
+            target_url = body.get("url")
+        except Exception:
+            pass
+
+    if not target_url:
+        raise HTTPException(
+            status_code=400,
+            detail="يرجى تزويد رابط الفيديو. مثال: ?url=https://youtube.com/... أو JSON body: {\"url\": \"...\"}",
+        )
+
+    target_url = target_url.strip()
+    if not re.match(r"^https?://", target_url, re.IGNORECASE):
+        raise HTTPException(
+            status_code=422,
+            detail="الرابط غير صالح. يجب أن يبدأ بـ http:// أو https://",
+        )
+
+    url = target_url
     platform = _detect_platform(url)
     logger.info("Extracting | platform=%s | url=%s", platform or "unknown", url)
 
