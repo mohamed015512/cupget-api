@@ -180,9 +180,30 @@ def _parse_formats(raw_formats: list[dict]) -> list[VideoFormat]:
 
         vcodec = fmt.get("vcodec", "none")
         acodec = fmt.get("acodec", "none")
+        fmt_id = str(fmt.get("format_id", ""))
+        fmt_note = fmt.get("format_note", "")
+
         has_video = vcodec not in (None, "none", "")
         has_audio = acodec not in (None, "none", "")
 
+        # ── Facebook / special cases ──────────────────────────────
+        # Progressive formats (sd/hd) from Facebook contain both
+        # video and audio but yt-dlp leaves codecs empty.
+        if not has_video and not has_audio:
+            if fmt_id in ("sd", "hd") or "progressive" in fmt_note.lower():
+                has_video = True
+                has_audio = True
+
+        # Facebook DASH video-only streams: format_id ends with 'v'
+        # and the URL carries bitrate info — mark correctly.
+        if fmt_id.endswith("v") and has_video and not has_audio:
+            pass  # already correct — video-only DASH stream
+
+        # Facebook DASH audio-only streams: format_id ends with 'a'
+        if fmt_id.endswith("a") and not has_video and has_audio:
+            pass  # already correct — audio-only DASH stream
+
+        # ── Resolution ────────────────────────────────────────────
         height = fmt.get("height")
         width = fmt.get("width")
         resolution = f"{width}x{height}" if (width and height) else None
@@ -192,10 +213,17 @@ def _parse_formats(raw_formats: list[dict]) -> list[VideoFormat]:
 
         filesize = fmt.get("filesize") or fmt.get("filesize_approx")
 
+        # ── Quality label override for sd/hd progressive ──────────
+        quality_label = _build_quality_label(fmt)
+        if fmt_id == "sd" and quality_label == "sd":
+            quality_label = "360p (SD)"
+        elif fmt_id == "hd" and quality_label == "hd":
+            quality_label = "720p (HD)"
+
         result.append(
             VideoFormat(
-                format_id=str(fmt.get("format_id", "")),
-                quality_label=_build_quality_label(fmt),
+                format_id=fmt_id,
+                quality_label=quality_label,
                 ext=fmt.get("ext", "mp4"),
                 resolution=resolution,
                 fps=fps,
@@ -208,11 +236,18 @@ def _parse_formats(raw_formats: list[dict]) -> list[VideoFormat]:
             )
         )
 
-    # Sort: combined (video+audio) first, then by height desc, then audio-only
+    # ── Sort: combined first → by height desc → video-only → audio-only ──
     def sort_key(f: VideoFormat):
-        combined = 0 if (f.has_video and f.has_audio) else (1 if f.has_video else 2)
+        if f.has_video and f.has_audio:
+            priority = 0
+        elif f.has_video:
+            priority = 1
+        elif f.has_audio:
+            priority = 3
+        else:
+            priority = 2  # unknown — put before audio-only
         height = int(f.resolution.split("x")[1]) if f.resolution else 0
-        return (combined, -height)
+        return (priority, -height)
 
     result.sort(key=sort_key)
     return result
