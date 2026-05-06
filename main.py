@@ -186,22 +186,28 @@ def _parse_formats(raw_formats: list[dict]) -> list[VideoFormat]:
         has_video = vcodec not in (None, "none", "")
         has_audio = acodec not in (None, "none", "")
 
-        # ── Facebook / special cases ──────────────────────────────
-        # Progressive formats (sd/hd) from Facebook contain both
-        # video and audio but yt-dlp leaves codecs empty.
+        # ── Smart progressive detection ───────────────────────────
         if not has_video and not has_audio:
+            # Case 1: Facebook sd/hd or "progressive" in format_note
             if fmt_id in ("sd", "hd") or "progressive" in fmt_note.lower():
                 has_video = True
                 has_audio = True
+            # Case 2: format_id is a quality like "720p"/"1080p" + direct mp4 URL
+            elif (
+                re.match(r"^\d{3,4}p$", fmt_id)
+                and ".mp4" in url
+                and ".m3u8" not in url
+            ):
+                has_video = True
+                has_audio = True
 
-        # Facebook DASH video-only streams: format_id ends with 'v'
-        # and the URL carries bitrate info — mark correctly.
+        # Facebook DASH video-only: format_id ends with 'v'
         if fmt_id.endswith("v") and has_video and not has_audio:
-            pass  # already correct — video-only DASH stream
+            pass  # correct — video-only DASH
 
-        # Facebook DASH audio-only streams: format_id ends with 'a'
+        # Facebook DASH audio-only: format_id ends with 'a'
         if fmt_id.endswith("a") and not has_video and has_audio:
-            pass  # already correct — audio-only DASH stream
+            pass  # correct — audio-only DASH
 
         # ── Resolution ────────────────────────────────────────────
         height = fmt.get("height")
