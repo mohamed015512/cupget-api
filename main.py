@@ -8,10 +8,11 @@ import re
 from contextlib import asynccontextmanager
 from typing import Any
 
+import httpx
 import yt_dlp
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, HttpUrl, field_validator
 
 # ──────────────────────────────────────────────
@@ -48,11 +49,11 @@ app = FastAPI(
 )
 
 # ──────────────────────────────────────────────
-# CORS — allow Flutter (or any client) to connect
+# CORS
 # ──────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # tighten in production if needed
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -91,7 +92,7 @@ class VideoFormat(BaseModel):
 class ExtractResponse(BaseModel):
     title: str
     thumbnail: str | None
-    duration: int | None        # seconds
+    duration: int | None
     uploader: str | None
     platform: str | None
     formats: list[VideoFormat]
@@ -100,55 +101,37 @@ class ExtractResponse(BaseModel):
 # ──────────────────────────────────────────────
 # yt-dlp helpers
 # ──────────────────────────────────────────────
-
-# A modern, realistic browser User-Agent
 _USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
 )
 
-# Shared ydl options — optimised for extraction only (no actual download)
 _YDL_OPTS: dict[str, Any] = {
-    # ── extraction behaviour ──────────────────
     "quiet": True,
     "no_warnings": True,
-    "noplaylist": True,          # single video, not whole playlist
+    "noplaylist": True,
     "extract_flat": False,
-
-    # ── bypass / anti-bot tricks ─────────────
     "nocheckcertificate": True,
     "ignoreerrors": False,
     "geo_bypass": True,
     "geo_bypass_country": "US",
-
-    # ── HTTP headers sent with every request ─
     "http_headers": {
         "User-Agent": _USER_AGENT,
         "Accept-Language": "en-US,en;q=0.9",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Referer": "https://www.google.com/",
     },
-
-    # ── retries & timeouts ───────────────────
     "retries": 3,
     "fragment_retries": 3,
     "socket_timeout": 30,
-
-    # ── platform-specific cookies (optional) ─
-    # "cookiefile": "/app/cookies.txt",   # uncomment and mount a cookies file
-
-    # ── format selection (fetch ALL formats) ─
     "format": "bestvideo+bestaudio/best",
     "merge_output_format": "mp4",
-
-    # ── output template (not used during info extraction) ─
     "outtmpl": "/tmp/%(id)s.%(ext)s",
 }
 
 
 def _build_quality_label(fmt: dict) -> str:
-    """Return a human-readable quality label for a format dict."""
     height = fmt.get("height")
     if height:
         fps = fmt.get("fps")
@@ -156,21 +139,16 @@ def _build_quality_label(fmt: dict) -> str:
         if fps and fps > 30:
             label += f"{int(fps)}"
         return label
-
-    # audio-only formats
     abr = fmt.get("abr")
     if abr:
         return f"Audio {int(abr)}kbps"
-
     note = fmt.get("format_note", "")
     if note:
         return note
-
     return fmt.get("format_id", "unknown")
 
 
 def _parse_formats(raw_formats: list[dict]) -> list[VideoFormat]:
-    """Convert yt-dlp format dicts into our VideoFormat schema."""
     result: list[VideoFormat] = []
 
     for fmt in raw_formats:
@@ -186,13 +164,10 @@ def _parse_formats(raw_formats: list[dict]) -> list[VideoFormat]:
         has_video = vcodec not in (None, "none", "")
         has_audio = acodec not in (None, "none", "")
 
-        # ── Smart progressive detection ───────────────────────────
         if not has_video and not has_audio:
-            # Case 1: Facebook sd/hd or "progressive" in format_note
             if fmt_id in ("sd", "hd") or "progressive" in fmt_note.lower():
                 has_video = True
                 has_audio = True
-            # Case 2: format_id is a quality like "720p"/"1080p" + direct mp4 URL
             elif (
                 re.match(r"^\d{3,4}p$", fmt_id)
                 and ".mp4" in url
@@ -201,25 +176,14 @@ def _parse_formats(raw_formats: list[dict]) -> list[VideoFormat]:
                 has_video = True
                 has_audio = True
 
-        # Facebook DASH video-only: format_id ends with 'v'
-        if fmt_id.endswith("v") and has_video and not has_audio:
-            pass  # correct — video-only DASH
-
-        # Facebook DASH audio-only: format_id ends with 'a'
-        if fmt_id.endswith("a") and not has_video and has_audio:
-            pass  # correct — audio-only DASH
-
-        # ── Resolution ────────────────────────────────────────────
         height = fmt.get("height")
         width = fmt.get("width")
         resolution = f"{width}x{height}" if (width and height) else None
 
         fps_raw = fmt.get("fps")
         fps = int(fps_raw) if fps_raw else None
-
         filesize = fmt.get("filesize") or fmt.get("filesize_approx")
 
-        # ── Quality label override for sd/hd progressive ──────────
         quality_label = _build_quality_label(fmt)
         if fmt_id == "sd" and quality_label == "sd":
             quality_label = "360p (SD)"
@@ -242,7 +206,6 @@ def _parse_formats(raw_formats: list[dict]) -> list[VideoFormat]:
             )
         )
 
-    # ── Sort: combined first → by height desc → video-only → audio-only ──
     def sort_key(f: VideoFormat):
         if f.has_video and f.has_audio:
             priority = 0
@@ -251,7 +214,7 @@ def _parse_formats(raw_formats: list[dict]) -> list[VideoFormat]:
         elif f.has_audio:
             priority = 3
         else:
-            priority = 2  # unknown — put before audio-only
+            priority = 2
         height = int(f.resolution.split("x")[1]) if f.resolution else 0
         return (priority, -height)
 
@@ -271,6 +234,7 @@ def _detect_platform(url: str) -> str | None:
         "Reddit": r"reddit\.com",
         "Twitch": r"twitch\.tv",
         "Snapchat": r"snapchat\.com",
+        "PornHub": r"pornhub\.com",
     }
     for name, pattern in patterns.items():
         if re.search(pattern, url, re.IGNORECASE):
@@ -305,17 +269,7 @@ async def health_check():
 
 @app.api_route("/extract", methods=["GET", "POST"], tags=["Extractor"])
 async def extract(request: Request, url: str = None):
-    """
-    Extract video metadata and direct download links from a URL.
-
-    - GET  /extract?url=https://...
-    - POST /extract  {"url": "https://..."}
-
-    Supports: YouTube, TikTok, Instagram, Twitter/X, Facebook, Vimeo,
-    Dailymotion, Reddit, Twitch, Snapchat, and 1000+ more sites.
-    """
-    # ── استخراج الـ URL من GET أو POST ──────────
-    target_url = url  # من query string في حالة GET
+    target_url = url
 
     if not target_url and request.method == "POST":
         try:
@@ -327,7 +281,7 @@ async def extract(request: Request, url: str = None):
     if not target_url:
         raise HTTPException(
             status_code=400,
-            detail="يرجى تزويد رابط الفيديو. مثال: ?url=https://youtube.com/... أو JSON body: {\"url\": \"...\"}",
+            detail='يرجى تزويد رابط الفيديو. مثال: ?url=https://youtube.com/... أو JSON body: {"url": "..."}',
         )
 
     target_url = target_url.strip()
@@ -348,46 +302,30 @@ async def extract(request: Request, url: str = None):
     except yt_dlp.utils.DownloadError as exc:
         err_msg = str(exc).lower()
         logger.warning("DownloadError for %s: %s", url, exc)
-
         if any(k in err_msg for k in ("private", "login", "sign in", "authentication")):
-            raise HTTPException(
-                status_code=403,
-                detail="This video is private or requires authentication.",
-            )
+            raise HTTPException(status_code=403, detail="This video is private or requires authentication.")
         if any(k in err_msg for k in ("not available", "removed", "deleted", "unavailable")):
-            raise HTTPException(
-                status_code=404,
-                detail="This video is no longer available or has been removed.",
-            )
+            raise HTTPException(status_code=404, detail="This video is no longer available or has been removed.")
         if "unsupported url" in err_msg:
-            raise HTTPException(
-                status_code=422,
-                detail="This URL is not supported. Please try a direct video link.",
-            )
+            raise HTTPException(status_code=422, detail="This URL is not supported.")
         if "geo" in err_msg or "not available in your country" in err_msg:
-            raise HTTPException(
-                status_code=451,
-                detail="This video is geo-restricted and not available in the server's region.",
-            )
+            raise HTTPException(status_code=451, detail="This video is geo-restricted.")
         raise HTTPException(status_code=400, detail=f"Could not extract video: {exc}")
 
     except yt_dlp.utils.ExtractorError as exc:
         logger.warning("ExtractorError for %s: %s", url, exc)
-        raise HTTPException(
-            status_code=422,
-            detail=f"Extractor failed for this URL: {exc}",
-        )
+        raise HTTPException(status_code=422, detail=f"Extractor failed: {exc}")
 
     except Exception as exc:
         logger.exception("Unexpected error extracting %s", url)
         raise HTTPException(status_code=500, detail=f"Unexpected error: {exc}")
 
     if not info:
-        raise HTTPException(status_code=404, detail="No information could be extracted from this URL.")
+        raise HTTPException(status_code=404, detail="No information could be extracted.")
 
     raw_formats: list[dict] = info.get("formats", [])
     if not raw_formats:
-        raise HTTPException(status_code=404, detail="No downloadable formats were found for this video.")
+        raise HTTPException(status_code=404, detail="No downloadable formats were found.")
 
     formats = _parse_formats(raw_formats)
 
@@ -400,10 +338,97 @@ async def extract(request: Request, url: str = None):
         formats=formats,
     )
 
-    logger.info(
-        "Extracted OK | title='%s' | formats=%d | platform=%s",
-        response.title,
-        len(formats),
-        response.platform,
-    )
+    logger.info("Extracted OK | title='%s' | formats=%d", response.title, len(formats))
     return response
+
+
+# ──────────────────────────────────────────────
+# HLS / Video Proxy
+# ──────────────────────────────────────────────
+@app.get("/proxy", tags=["Proxy"])
+async def proxy(url: str, request: Request):
+    """
+    يجلب أي رابط (m3u8 أو فيديو مباشر) من السيرفر ويمرره للمتصفح
+    متجاوزاً قيود CORS الخاصة بالمنصات.
+    """
+    if not re.match(r"^https?://", url, re.IGNORECASE):
+        raise HTTPException(status_code=400, detail="Invalid URL")
+
+    # استخراج الـ origin من الرابط للـ Referer
+    try:
+        parts = url.split("/")
+        origin = f"{parts[0]}//{parts[2]}"
+    except Exception:
+        origin = "https://www.google.com"
+
+    headers = {
+        "User-Agent": _USER_AGENT,
+        "Referer": origin + "/",
+        "Origin": origin,
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=30.0,
+        ) as client:
+
+            # ── m3u8 playlist ────────────────────────────────────
+            if ".m3u8" in url:
+                resp = await client.get(url, headers=headers)
+                resp.raise_for_status()
+
+                base_url = url.rsplit("/", 1)[0] + "/"
+                lines = []
+
+                for line in resp.text.splitlines():
+                    stripped = line.strip()
+                    if stripped and not stripped.startswith("#"):
+                        if stripped.startswith("http"):
+                            # رابط كامل — مرره عبر proxy
+                            line = f"/proxy?url={stripped}"
+                        else:
+                            # رابط نسبي — أكمله ثم مرره عبر proxy
+                            line = f"/proxy?url={base_url}{stripped}"
+                    lines.append(line)
+
+                return StreamingResponse(
+                    iter(["\n".join(lines).encode()]),
+                    media_type="application/vnd.apple.mpegurl",
+                    headers={
+                        "Access-Control-Allow-Origin": "*",
+                        "Cache-Control": "no-cache",
+                    },
+                )
+
+            # ── فيديو مباشر mp4 / ts ─────────────────────────────
+            else:
+                req_headers = dict(headers)
+                # دعم Range للتخطي داخل الفيديو
+                if "range" in request.headers:
+                    req_headers["Range"] = request.headers["range"]
+
+                resp = await client.get(url, headers=req_headers)
+
+                return StreamingResponse(
+                    resp.aiter_bytes(chunk_size=65536),
+                    status_code=resp.status_code,
+                    media_type=resp.headers.get("content-type", "video/mp4"),
+                    headers={
+                        "Access-Control-Allow-Origin": "*",
+                        "Accept-Ranges": "bytes",
+                        "Content-Length": resp.headers.get("content-length", ""),
+                        "Cache-Control": "no-cache",
+                    },
+                )
+
+    except httpx.HTTPStatusError as e:
+        logger.warning("Proxy upstream error %s for %s", e.response.status_code, url)
+        raise HTTPException(status_code=e.response.status_code, detail="Upstream error")
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Upstream timeout")
+    except Exception as e:
+        logger.exception("Proxy failed for %s", url)
+        raise HTTPException(status_code=502, detail=f"Proxy failed: {e}")
